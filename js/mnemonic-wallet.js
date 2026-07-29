@@ -455,6 +455,79 @@
     return new Uint8Array(new TextEncoder().encode(str));
   }
 
+  function hexToBytes(hex) {
+    var out = new Uint8Array(hex.length / 2);
+    for (var i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return out;
+  }
+
+  function randomBytes(n) {
+    var b = new Uint8Array(n);
+    window.crypto.getRandomValues(b);
+    return b;
+  }
+
+  //////////////////////////////////////////////////////////////////////////
+  // Mnemonic backup storage (encrypted at rest with the wallet password,
+  // via the browser's own Web Crypto AES-GCM implementation — this file
+  // never re-implements AES itself). Stored separately from `wallets` so
+  // it never interferes with anything the rest of the app reads/writes.
+  //////////////////////////////////////////////////////////////////////////
+
+  function encryptMnemonicBackup(mnemonic, password) {
+    if (!window.crypto || !window.crypto.subtle) return Promise.reject(new Error('Web Crypto not available'));
+    var salt = randomBytes(16);
+    var iv = randomBytes(12);
+    return window.crypto.subtle.importKey('raw', utf8Bytes(password), { name: 'PBKDF2' }, false, ['deriveKey']).then(function (keyMaterial) {
+      return window.crypto.subtle.deriveKey(
+        { name: 'PBKDF2', salt: salt, iterations: 100000, hash: 'SHA-256' },
+        keyMaterial, { name: 'AES-GCM', length: 256 }, false, ['encrypt']
+      );
+    }).then(function (key) {
+      return window.crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, utf8Bytes(mnemonic));
+    }).then(function (cipherBuf) {
+      return { salt: bytesToHex(salt), iv: bytesToHex(iv), ciphertext: bytesToHex(new Uint8Array(cipherBuf)) };
+    });
+  }
+
+  function decryptMnemonicBackup(backup, password) {
+    if (!window.crypto || !window.crypto.subtle) return Promise.reject(new Error('Web Crypto not available'));
+    var salt = hexToBytes(backup.salt);
+    var iv = hexToBytes(backup.iv);
+    return window.crypto.subtle.importKey('raw', utf8Bytes(password), { name: 'PBKDF2' }, false, ['deriveKey']).then(function (keyMaterial) {
+      return window.crypto.subtle.deriveKey(
+        { name: 'PBKDF2', salt: salt, iterations: 100000, hash: 'SHA-256' },
+        keyMaterial, { name: 'AES-GCM', length: 256 }, false, ['decrypt']
+      );
+    }).then(function (key) {
+      return window.crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, hexToBytes(backup.ciphertext));
+    }).then(function (plainBuf) {
+      return new TextDecoder().decode(plainBuf);
+    });
+    // Wrong password => AES-GCM auth tag check fails => promise rejects.
+  }
+
+  function getBackups(injector) {
+    var storage = injector.get('$localStorage');
+    return storage.mnemonicBackups || {};
+  }
+
+  function saveBackup(injector, address, backup) {
+    var storage = injector.get('$localStorage');
+    var backups = Object.assign({}, storage.mnemonicBackups || {});
+    backups[address] = backup;
+    storage.mnemonicBackups = backups;
+    injector.get('$rootScope').$applyAsync();
+  }
+
+  function deleteBackup(injector, address) {
+    var storage = injector.get('$localStorage');
+    var backups = Object.assign({}, storage.mnemonicBackups || {});
+    delete backups[address];
+    storage.mnemonicBackups = backups;
+    injector.get('$rootScope').$applyAsync();
+  }
+
   //////////////////////////////////////////////////////////////////////////
   // BIP-39
   //////////////////////////////////////////////////////////////////////////
@@ -579,78 +652,19 @@
   }
 
   //////////////////////////////////////////////////////////////////////////
-  // Angular integration (mirrors the fail-safe pattern used by
-  // dynamic-nodes.js elsewhere in this app: poll for the injector, never
-  // throw past this file's own boundary).
+  // Small DOM helpers
   //////////////////////////////////////////////////////////////////////////
-
-  var INJECTOR_POLL_MS = 200;
-  var INJECTOR_POLL_MAX = 50;
-  var NETWORKS = [
-    { id: 104, label: 'Mainnet' },
-    { id: -104, label: 'Testnet' }
-  ];
-
-  function waitForInjector(attempt) {
-    var injector = null;
-    try {
-      injector = window.angular && angular.element(document).injector();
-    } catch (e) {
-      injector = null;
-    }
-    if (injector) {
-      try { buildUI(injector); } catch (e) { /* fail safe: no UI, rest of app unaffected */ }
-      return;
-    }
-    if (attempt >= INJECTOR_POLL_MAX) return;
-    setTimeout(function () { waitForInjector(attempt + 1); }, INJECTOR_POLL_MS);
-  }
-
-  function css(el, styles) {
-    for (var k in styles) if (styles.hasOwnProperty(k)) el.style[k] = styles[k];
-    return el;
-  }
 
   function el(tag, styles, attrs) {
     var e = document.createElement(tag);
-    if (styles) css(e, styles);
-    if (attrs) for (var k in attrs) if (attrs.hasOwnProperty(k)) e.setAttribute(k, attrs[k]);
+    if (styles) for (var k in styles) if (styles.hasOwnProperty(k)) e.style[k] = styles[k];
+    if (attrs) for (var a in attrs) if (attrs.hasOwnProperty(a)) e.setAttribute(a, attrs[a]);
     return e;
   }
 
-  //////////////////////////////////////////////////////////////////////////
-  // UI
-  //////////////////////////////////////////////////////////////////////////
-
-  function buildUI(injector) {
-    var COLORS = { primary: '#8e1bd6', primaryDark: '#6c14a6', danger: '#d6336c', ok: '#2f9e44', bg: '#1b0f2b', text: '#ffffff' };
-
-    // ---- Floating launcher button ----
-    var launcher = el('button', {
-      position: 'fixed', right: '24px', bottom: '24px', zIndex: 99998,
-      background: COLORS.primary, color: '#fff', border: 'none', borderRadius: '999px',
-      padding: '12px 18px', fontSize: '14px', fontFamily: 'sans-serif', cursor: 'pointer',
-      boxShadow: '0 4px 14px rgba(0,0,0,0.35)'
-    });
-    launcher.textContent = 'Mnemonic Wallet';
-    launcher.addEventListener('mouseenter', function () { launcher.style.background = COLORS.primaryDark; });
-    launcher.addEventListener('mouseleave', function () { launcher.style.background = COLORS.primary; });
-    document.body.appendChild(launcher);
-
-    // ---- Overlay + modal skeleton (built lazily on first open) ----
-    var overlay = null;
-
-    launcher.addEventListener('click', function () {
-      if (!overlay) overlay = buildModal(injector, COLORS, function close() {
-        overlay.style.display = 'none';
-      });
-      overlay.style.display = 'flex';
-    });
-  }
-
-  function labeled(labelText, inputEl, colors) {
-    var wrap = el('div', { marginBottom: '14px' });
-    var label = el('label', { display: 'block', fontSize: '12px', color: '#cbb8e0', marginBottom: '4px', fontFamily: 'sans-serif' });
+  function formGroup(labelText, inputEl) {
+    var wrap = el('div', {}, { 'class': 'form-group' });
+    var label = document.createElement('label');
     label.textContent = labelText;
     wrap.appendChild(label);
     wrap.appendChild(inputEl);
@@ -658,127 +672,29 @@
   }
 
   function textInput(placeholder, type) {
-    return el('input', {
-      width: '100%', boxSizing: 'border-box', padding: '9px 10px', borderRadius: '6px',
-      border: '1px solid #5a3d78', background: '#2a1740', color: '#fff', fontSize: '13px', fontFamily: 'sans-serif'
-    }, { type: type || 'text', placeholder: placeholder || '' });
-  }
-
-  function buildModal(injector, COLORS, close) {
-    var overlay = el('div', {
-      position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 99999,
-      background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center'
-    });
-
-    var box = el('div', {
-      width: '460px', maxWidth: '92vw', maxHeight: '86vh', overflowY: 'auto',
-      background: COLORS.bg, borderRadius: '10px', padding: '20px', boxShadow: '0 10px 40px rgba(0,0,0,0.5)',
-      fontFamily: 'sans-serif', color: '#fff'
-    });
-    overlay.appendChild(box);
-    overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
-
-    var titleRow = el('div', { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '14px' });
-    var title = el('h3', { margin: '0', fontSize: '16px', color: '#fff' });
-    title.textContent = 'Mnemonic Wallet';
-    var closeX = el('span', { cursor: 'pointer', fontSize: '18px', color: '#cbb8e0', lineHeight: '1' });
-    closeX.textContent = '\u00d7';
-    closeX.addEventListener('click', function () { close(); });
-    titleRow.appendChild(title);
-    titleRow.appendChild(closeX);
-    box.appendChild(titleRow);
-
-    // Tabs
-    var tabBar = el('div', { display: 'flex', marginBottom: '16px', borderBottom: '1px solid #5a3d78' });
-    var tabCreate = el('div', { padding: '8px 14px', cursor: 'pointer', fontSize: '13px', borderBottom: '2px solid ' + COLORS.primary, color: '#fff' });
-    tabCreate.textContent = 'Create new';
-    var tabImport = el('div', { padding: '8px 14px', cursor: 'pointer', fontSize: '13px', borderBottom: '2px solid transparent', color: '#cbb8e0' });
-    tabImport.textContent = 'Import existing';
-    tabBar.appendChild(tabCreate); tabBar.appendChild(tabImport);
-    box.appendChild(tabBar);
-
-    var body = el('div', {});
-    box.appendChild(body);
-
-    function switchTab(which) {
-      tabCreate.style.borderBottomColor = which === 'create' ? COLORS.primary : 'transparent';
-      tabCreate.style.color = which === 'create' ? '#fff' : '#cbb8e0';
-      tabImport.style.borderBottomColor = which === 'import' ? COLORS.primary : 'transparent';
-      tabImport.style.color = which === 'import' ? '#fff' : '#cbb8e0';
-      body.innerHTML = '';
-      if (which === 'create') body.appendChild(buildCreatePane(injector, COLORS, close));
-      else body.appendChild(buildImportPane(injector, COLORS, close));
-    }
-    tabCreate.addEventListener('click', function () { switchTab('create'); });
-    tabImport.addEventListener('click', function () { switchTab('import'); });
-    switchTab('create');
-
-    document.body.appendChild(overlay);
-    return overlay;
-  }
-
-  // Common fields used by both panes: name / password / confirm / network / advanced (passphrase + account index)
-  function buildCommonFields(colors) {
-    var frag = document.createDocumentFragment();
-
-    var nameInput = textInput('e.g. My Wallet');
-    frag.appendChild(labeled('Wallet name', nameInput));
-
-    var passInput = textInput('At least 40 characters recommended', 'password');
-    frag.appendChild(labeled('Password', passInput));
-
-    var passConfirm = textInput('Repeat password', 'password');
-    frag.appendChild(labeled('Confirm password', passConfirm));
-
-    var networkSelect = el('select', {
-      width: '100%', boxSizing: 'border-box', padding: '9px 10px', borderRadius: '6px',
-      border: '1px solid #5a3d78', background: '#2a1740', color: '#fff', fontSize: '13px'
-    });
-    NETWORKS.forEach(function (n) {
-      var opt = el('option', {}, { value: String(n.id) });
-      opt.textContent = n.label;
-      networkSelect.appendChild(opt);
-    });
-    frag.appendChild(labeled('Network', networkSelect));
-
-    var advancedToggle = el('div', { fontSize: '12px', color: '#a98fc9', cursor: 'pointer', marginBottom: '8px', textDecoration: 'underline' });
-    advancedToggle.textContent = 'Advanced options (passphrase / account index)';
-    var advancedBox = el('div', { display: 'none', marginBottom: '10px' });
-    var passphraseInput = textInput('Optional extra passphrase (25th word)');
-    advancedBox.appendChild(labeled('Passphrase (optional)', passphraseInput));
-    var accountIndexInput = textInput('0');
-    accountIndexInput.value = '0';
-    advancedBox.appendChild(labeled('Account index', accountIndexInput));
-    advancedToggle.addEventListener('click', function () {
-      advancedBox.style.display = advancedBox.style.display === 'none' ? 'block' : 'none';
-    });
-    frag.appendChild(advancedToggle);
-    frag.appendChild(advancedBox);
-
-    return {
-      frag: frag,
-      nameInput: nameInput, passInput: passInput, passConfirm: passConfirm,
-      networkSelect: networkSelect, passphraseInput: passphraseInput, accountIndexInput: accountIndexInput
-    };
+    return el('input', {}, { type: type || 'text', 'class': 'form-control', placeholder: placeholder || '' });
   }
 
   function showMessage(container, text, isError) {
     var m = container._msgEl;
     if (!m) {
-      m = el('div', { fontSize: '12px', marginTop: '10px', padding: '8px 10px', borderRadius: '6px' });
+      m = el('p', { marginTop: '10px' });
       container.appendChild(m);
       container._msgEl = m;
     }
     m.textContent = text;
-    m.style.background = isError ? 'rgba(214,51,108,0.15)' : 'rgba(47,158,68,0.15)';
-    m.style.color = isError ? '#ff8fb3' : '#7be495';
-    m.style.display = 'block';
+    m.className = isError ? 'bg-danger' : 'bg-success';
   }
 
-  // Reuses the app's own WalletBuilder.createPrivateKeyWallet pipeline so
-  // storage / encryption / decryption stay 100% consistent with every other
-  // wallet in the app. Mirrors what SignupCtrl.endSignup() does after its
-  // safety-protocol step.
+  //////////////////////////////////////////////////////////////////////////
+  // Wallet creation, shared by every entry point in this file. Reuses the
+  // app's own WalletBuilder.createPrivateKeyWallet(...) pipeline (the exact
+  // function behind "import private key") so storage / encryption /
+  // decryption stay 100% consistent with every other wallet in the app,
+  // then logs straight into the new wallet the same way the normal signup
+  // flow does.
+  //////////////////////////////////////////////////////////////////////////
+
   function finalizeWallet(injector, opts, onDone, onError) {
     try {
       var WalletBuilder = injector.get('WalletBuilder');
@@ -789,14 +705,12 @@
       var Login = injector.get('Login');
 
       WalletBuilder.createPrivateKeyWallet(opts.walletName, opts.password, opts.privateKey, opts.network).then(function (wallet) {
-        if (!wallet || typeof wallet !== 'object') { onError('Could not create the wallet (invalid form data or name already used).'); return; }
+        if (!wallet || typeof wallet !== 'object') { onError('ウォレットを作成できませんでした（入力内容を確認するか、同じ名前のウォレットが既にあります）。'); return; }
         try {
           AddressBook.addAccount(wallet.accounts[0].address);
           storage.wallets = (storage.wallets || []).concat(wallet);
-          ngToast.create({ className: 'success', content: 'Wallet created from mnemonic.' });
+          ngToast.create({ className: 'success', content: 'ニーモニックからウォレットを作成しました。' });
 
-          // Log straight into the new wallet and jump to the dashboard,
-          // same as the normal signup/import flows do.
           var common = { password: opts.password, privateKey: '', isHW: false };
           var loggedIn = false;
           try { loggedIn = Login.login(common, wallet); } catch (e3) { loggedIn = false; }
@@ -804,91 +718,123 @@
           rootScope.$applyAsync();
           onDone(wallet, loggedIn);
         } catch (e2) {
-          onError('Wallet was created but could not be saved: ' + e2.message);
+          onError('ウォレットは作成されましたが保存に失敗しました: ' + e2.message);
         }
       }, function () {
-        onError('Could not create the wallet (invalid form data or name already used).');
+        onError('ウォレットを作成できませんでした（入力内容を確認するか、同じ名前のウォレットが既にあります）。');
       });
     } catch (e) {
-      onError('Unexpected error: ' + e.message);
+      onError('予期しないエラー: ' + e.message);
     }
   }
 
+  //////////////////////////////////////////////////////////////////////////
+  // Create / Import panel — a single reusable piece of UI, used inline on
+  // the signup page (no floating window, no separate modal).
+  //////////////////////////////////////////////////////////////////////////
+
+  var NETWORKS = [
+    { id: 104, label: 'メインネット' },
+    { id: -104, label: 'テストネット' }
+  ];
+
+  function buildAdvancedFields() {
+    var wrap = document.createDocumentFragment();
+    var toggle = el('a', { display: 'inline-block', marginBottom: '10px', cursor: 'pointer' }, { href: '' });
+    toggle.textContent = '詳細オプション（パスフレーズ／アカウント番号）';
+    var box = el('div', { display: 'none' });
+    var passphraseInput = textInput('追加パスフレーズ（省略可・25番目の単語）');
+    box.appendChild(formGroup('パスフレーズ（省略可）', passphraseInput));
+    var accountIndexInput = textInput('0');
+    accountIndexInput.value = '0';
+    box.appendChild(formGroup('アカウント番号', accountIndexInput));
+    toggle.addEventListener('click', function (e) {
+      e.preventDefault();
+      box.style.display = box.style.display === 'none' ? 'block' : 'none';
+    });
+    wrap.appendChild(toggle);
+    wrap.appendChild(box);
+    return { frag: wrap, passphraseInput: passphraseInput, accountIndexInput: accountIndexInput };
+  }
+
+  function buildCommonFields() {
+    var frag = document.createDocumentFragment();
+    var nameInput = textInput('例）マイウォレット');
+    frag.appendChild(formGroup('ウォレット名', nameInput));
+    var passInput = textInput('40文字以上を推奨', 'password');
+    frag.appendChild(formGroup('パスワード', passInput));
+    var passConfirm = textInput('パスワード（確認）', 'password');
+    frag.appendChild(formGroup('パスワード（確認）', passConfirm));
+    var networkSelect = el('select', {}, { 'class': 'form-control' });
+    NETWORKS.forEach(function (n) {
+      var opt = el('option', {}, { value: String(n.id) });
+      opt.textContent = n.label;
+      networkSelect.appendChild(opt);
+    });
+    frag.appendChild(formGroup('ネットワーク', networkSelect));
+    var adv = buildAdvancedFields();
+    frag.appendChild(adv.frag);
+    return {
+      frag: frag, nameInput: nameInput, passInput: passInput, passConfirm: passConfirm,
+      networkSelect: networkSelect, passphraseInput: adv.passphraseInput, accountIndexInput: adv.accountIndexInput
+    };
+  }
+
   function validateCommon(fields, msgContainer) {
-    if (!fields.nameInput.value.trim()) { showMessage(msgContainer, 'Please enter a wallet name.', true); return null; }
-    if (!fields.passInput.value || fields.passInput.value.length < 8) { showMessage(msgContainer, 'Password must be at least 8 characters.', true); return null; }
-    if (fields.passInput.value !== fields.passConfirm.value) { showMessage(msgContainer, 'Passwords do not match.', true); return null; }
+    if (!fields.nameInput.value.trim()) { showMessage(msgContainer, 'ウォレット名を入力してください。', true); return null; }
+    if (!fields.passInput.value || fields.passInput.value.length < 8) { showMessage(msgContainer, 'パスワードは8文字以上にしてください。', true); return null; }
+    if (fields.passInput.value !== fields.passConfirm.value) { showMessage(msgContainer, 'パスワードが一致しません。', true); return null; }
     var accountIndex = parseInt(fields.accountIndexInput.value, 10);
     if (isNaN(accountIndex) || accountIndex < 0) accountIndex = 0;
     return {
-      walletName: fields.nameInput.value.trim(),
-      password: fields.passInput.value,
-      network: parseInt(fields.networkSelect.value, 10),
-      passphrase: fields.passphraseInput.value || '',
+      walletName: fields.nameInput.value.trim(), password: fields.passInput.value,
+      network: parseInt(fields.networkSelect.value, 10), passphrase: fields.passphraseInput.value || '',
       accountIndex: accountIndex
     };
   }
 
-  function buildCreatePane(injector, COLORS, close) {
-    var pane = el('div', {});
+  function buildCreatePanel(injector, onDone) {
+    var pane = el('div', {}, { 'class': 'form-group' });
 
-    var strengthRow = el('div', { display: 'flex', gap: '10px', marginBottom: '12px' });
-    var btn12 = el('button', { flex: '1', padding: '8px', borderRadius: '6px', border: '1px solid ' + COLORS.primary, background: COLORS.primary, color: '#fff', cursor: 'pointer' });
-    btn12.textContent = '12 words';
-    var btn24 = el('button', { flex: '1', padding: '8px', borderRadius: '6px', border: '1px solid ' + COLORS.primary, background: 'transparent', color: '#fff', cursor: 'pointer' });
-    btn24.textContent = '24 words';
+    var strengthRow = el('div', { display: 'flex', gap: '8px', marginBottom: '10px' });
+    var btn12 = el('button', { flex: '1' }, { type: 'button', 'class': 'btn btn-primary' });
+    btn12.textContent = '12語';
+    var btn24 = el('button', { flex: '1' }, { type: 'button', 'class': 'btn btn-default' });
+    btn24.textContent = '24語';
     strengthRow.appendChild(btn12); strengthRow.appendChild(btn24);
     pane.appendChild(strengthRow);
 
-    var mnemonicBox = el('div', {
-      background: '#2a1740', border: '1px dashed #5a3d78', borderRadius: '6px', padding: '12px',
-      fontFamily: 'monospace', fontSize: '13px', lineHeight: '1.6', marginBottom: '8px', filter: 'blur(5px)', userSelect: 'none'
-    });
+    var mnemonicBox = el('p', { fontFamily: 'monospace', wordBreak: 'break-word', filter: 'blur(4px)' }, { 'class': 'bg-info' });
     var currentMnemonic = generateMnemonic(128);
     mnemonicBox.textContent = currentMnemonic;
     pane.appendChild(mnemonicBox);
 
     var revealed = false;
-    var actionsRow = el('div', { display: 'flex', gap: '10px', marginBottom: '10px' });
-    var revealBtn = el('button', {
-      flex: '1', padding: '7px', borderRadius: '6px', border: '1px solid #5a3d78',
-      background: 'transparent', color: '#cbb8e0', cursor: 'pointer', fontSize: '12px'
-    });
-    revealBtn.textContent = 'Show words';
-    var copyBtn = el('button', {
-      flex: '1', padding: '7px', borderRadius: '6px', border: '1px solid #5a3d78',
-      background: 'transparent', color: '#cbb8e0', cursor: 'pointer', fontSize: '12px'
-    });
-    copyBtn.textContent = 'Copy to clipboard';
+    var actionsRow = el('div', { display: 'flex', gap: '8px', marginBottom: '10px' });
+    var revealBtn = el('button', { flex: '1' }, { type: 'button', 'class': 'btn btn-default' });
+    revealBtn.textContent = '表示する';
+    var copyBtn = el('button', { flex: '1' }, { type: 'button', 'class': 'btn btn-default' });
+    copyBtn.textContent = 'コピー';
     function setRevealed(v) {
       revealed = v;
-      mnemonicBox.style.filter = revealed ? 'none' : 'blur(5px)';
-      revealBtn.textContent = revealed ? 'Hide words' : 'Show words';
+      mnemonicBox.style.filter = revealed ? 'none' : 'blur(4px)';
+      revealBtn.textContent = revealed ? '隠す' : '表示する';
     }
     revealBtn.addEventListener('click', function () { setRevealed(!revealed); });
     copyBtn.addEventListener('click', function () {
       setRevealed(true);
       try {
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(currentMnemonic);
-        } else {
-          var ta = document.createElement('textarea');
-          ta.value = currentMnemonic;
-          document.body.appendChild(ta);
-          ta.select();
-          document.execCommand('copy');
-          document.body.removeChild(ta);
-        }
-        copyBtn.textContent = 'Copied!';
-        setTimeout(function () { copyBtn.textContent = 'Copy to clipboard'; }, 1500);
+        if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(currentMnemonic);
+        copyBtn.textContent = 'コピーしました';
+        setTimeout(function () { copyBtn.textContent = 'コピー'; }, 1500);
       } catch (e) { /* clipboard unavailable: words are already shown for manual copy */ }
     });
     actionsRow.appendChild(revealBtn); actionsRow.appendChild(copyBtn);
     pane.appendChild(actionsRow);
 
-    var hint = el('div', { fontSize: '11px', color: '#a98fc9', marginBottom: '10px' });
-    hint.textContent = 'Write these words down in order and store them somewhere safe and offline. Anyone with this phrase can spend your funds.';
-    pane.appendChild(hint);
+    var warn = el('p', {}, { 'class': 'bg-warning' });
+    warn.textContent = 'この単語列を順番通りに書き留め、オフラインの安全な場所に保管してください。このフレーズを知る人は誰でも資金を送金できます。';
+    pane.appendChild(warn);
 
     function regen(strength) {
       currentMnemonic = generateMnemonic(strength);
@@ -896,158 +842,427 @@
       setRevealed(false);
       setBackupChecked(false);
     }
-    btn12.addEventListener('click', function () { btn12.style.background = COLORS.primary; btn24.style.background = 'transparent'; regen(128); });
-    btn24.addEventListener('click', function () { btn24.style.background = COLORS.primary; btn12.style.background = 'transparent'; regen(256); });
+    btn12.addEventListener('click', function () { btn12.className = 'btn btn-primary'; btn24.className = 'btn btn-default'; regen(128); });
+    btn24.addEventListener('click', function () { btn24.className = 'btn btn-primary'; btn12.className = 'btn btn-default'; regen(256); });
 
-    var refreshRow = el('div', { textAlign: 'right', marginBottom: '10px' });
-    var refreshLink = el('a', { fontSize: '11px', color: '#a98fc9', cursor: 'pointer', textDecoration: 'underline' });
-    refreshLink.textContent = 'Generate a different phrase';
-    refreshLink.addEventListener('click', function () { regen(currentMnemonic.split(' ').length === 12 ? 128 : 256); });
-    refreshRow.appendChild(refreshLink);
-    pane.appendChild(refreshRow);
+    var refreshLink = el('a', { display: 'inline-block', marginBottom: '10px', cursor: 'pointer' }, { href: '' });
+    refreshLink.textContent = '別のフレーズを生成する';
+    refreshLink.addEventListener('click', function (e) { e.preventDefault(); regen(currentMnemonic.split(' ').length === 12 ? 128 : 256); });
+    pane.appendChild(refreshLink);
 
     var backupChecked = false;
     var backupRow = el('div', {
-      display: 'flex', alignItems: 'flex-start', gap: '10px', fontSize: '12px', color: '#cbb8e0',
-      marginBottom: '14px', cursor: 'pointer', padding: '10px', borderRadius: '6px',
-      border: '1px solid #d6336c', background: 'rgba(214,51,108,0.08)'
+      display: 'flex', alignItems: 'flex-start', gap: '10px', cursor: 'pointer', padding: '10px',
+      borderRadius: '4px', border: '1px solid #d43f3a', marginBottom: '14px'
     });
     var backupBox = el('div', {
-      width: '20px', height: '20px', minWidth: '20px', borderRadius: '4px',
-      border: '2px solid #cbb8e0', display: 'flex', alignItems: 'center', justifyContent: 'center',
-      fontSize: '13px', color: '#fff', marginTop: '1px'
+      width: '20px', height: '20px', minWidth: '20px', borderRadius: '3px', border: '2px solid #d43f3a',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', marginTop: '1px'
     });
     var backupText = document.createElement('span');
-    backupText.textContent = 'I have written down this mnemonic phrase and stored it safely.';
-    backupRow.appendChild(backupBox);
-    backupRow.appendChild(backupText);
+    backupText.textContent = 'このニーモニックフレーズを書き留め、安全に保管しました。';
+    backupRow.appendChild(backupBox); backupRow.appendChild(backupText);
     pane.appendChild(backupRow);
-
-    // A hidden native checkbox keeps the "checked" state easy to read from
-    // the submit handler, but all visuals/clicks are driven manually so this
-    // works the same regardless of how the browser renders checkboxes.
     var backupCheck = { checked: false };
     function setBackupChecked(v) {
-      backupChecked = v;
-      backupCheck.checked = v;
-      backupBox.style.background = v ? COLORS.primary : 'transparent';
-      backupBox.style.borderColor = v ? COLORS.primary : '#cbb8e0';
+      backupChecked = v; backupCheck.checked = v;
+      backupBox.style.background = v ? '#3c763d' : 'transparent';
+      backupBox.style.borderColor = v ? '#3c763d' : '#d43f3a';
       backupBox.textContent = v ? '\u2713' : '';
-      backupRow.style.borderColor = v ? COLORS.primary : '#d6336c';
-      backupRow.style.background = v ? 'rgba(142,27,214,0.12)' : 'rgba(214,51,108,0.08)';
+      backupRow.style.borderColor = v ? '#3c763d' : '#d43f3a';
     }
     backupRow.addEventListener('click', function () { setBackupChecked(!backupChecked); });
 
-    var fields = buildCommonFields(COLORS);
+    var fields = buildCommonFields();
     pane.appendChild(fields.frag);
 
-    var submitBtn = el('button', {
-      width: '100%', padding: '11px', borderRadius: '6px', border: 'none',
-      background: COLORS.primary, color: '#fff', fontSize: '14px', cursor: 'pointer', marginTop: '4px'
-    });
-    submitBtn.textContent = 'Create wallet';
+    var submitBtn = el('button', { width: '100%' }, { type: 'button', 'class': 'btn btn-primary' });
+    submitBtn.textContent = 'ウォレットを作成';
     pane.appendChild(submitBtn);
 
     submitBtn.addEventListener('click', function () {
-      if (!backupCheck.checked) { showMessage(pane, 'Please confirm you backed up the mnemonic phrase.', true); return; }
+      if (!backupCheck.checked) { showMessage(pane, 'ニーモニックフレーズをバックアップしたことを確認してください。', true); return; }
       var common = validateCommon(fields, pane);
       if (!common) return;
       submitBtn.disabled = true;
-      submitBtn.textContent = 'Creating...';
+      submitBtn.textContent = '作成中...';
       try {
         var privateKey = nemPrivateKeyFromMnemonic(currentMnemonic, common.passphrase, common.accountIndex);
         finalizeWallet(injector, {
           walletName: common.walletName, password: common.password, network: common.network, privateKey: privateKey
         }, function (wallet, loggedIn) {
-          submitBtn.textContent = 'Done';
-          if (loggedIn) {
-            showMessage(pane, 'Wallet "' + common.walletName + '" created. Opening your dashboard...', false);
-            setTimeout(close, 900);
-          } else {
-            showMessage(pane, 'Wallet "' + common.walletName + '" created but could not be opened automatically. Reload the login page and select it from your wallet list.', true);
-          }
+          submitBtn.textContent = '完了';
+          encryptMnemonicBackup(currentMnemonic, common.password).then(function (backup) {
+            saveBackup(injector, wallet.accounts[0].address, backup);
+          }).catch(function () { /* backup storage is best-effort */ });
+          showMessage(pane, loggedIn ? 'ウォレット「' + common.walletName + '」を作成しました。ダッシュボードに移動します...' : 'ウォレットは作成されましたが自動的に開けませんでした。ログイン画面から選択してください。', !loggedIn);
+          if (onDone) onDone(wallet, loggedIn);
         }, function (msg) {
           submitBtn.disabled = false;
-          submitBtn.textContent = 'Create wallet';
+          submitBtn.textContent = 'ウォレットを作成';
           showMessage(pane, msg, true);
         });
       } catch (e) {
         submitBtn.disabled = false;
-        submitBtn.textContent = 'Create wallet';
-        showMessage(pane, 'Could not derive a key from this mnemonic: ' + e.message, true);
+        submitBtn.textContent = 'ウォレットを作成';
+        showMessage(pane, 'このニーモニックから鍵を導出できませんでした: ' + e.message, true);
       }
     });
 
     return pane;
   }
 
-  function buildImportPane(injector, COLORS, close) {
-    var pane = el('div', {});
+  function buildImportPanel(injector, onDone) {
+    var pane = el('div', {}, { 'class': 'form-group' });
 
-    var mnemonicArea = el('textarea', {
-      width: '100%', boxSizing: 'border-box', minHeight: '70px', padding: '9px 10px', borderRadius: '6px',
-      border: '1px solid #5a3d78', background: '#2a1740', color: '#fff', fontSize: '13px', fontFamily: 'monospace', resize: 'vertical'
-    }, { placeholder: 'Enter your 12 or 24 word mnemonic phrase, separated by spaces' });
-    pane.appendChild(labeled('Mnemonic phrase', mnemonicArea));
+    var mnemonicArea = el('textarea', { fontFamily: 'monospace', minHeight: '70px' }, { 'class': 'form-control', placeholder: '12語または24語のニーモニックフレーズをスペース区切りで入力してください' });
+    pane.appendChild(formGroup('ニーモニックフレーズ', mnemonicArea));
 
-    var validityMsg = el('div', { fontSize: '11px', marginBottom: '10px', minHeight: '14px' });
+    var validityMsg = el('p', { fontSize: '12px' });
     pane.appendChild(validityMsg);
 
     mnemonicArea.addEventListener('input', function () {
       var v = validateMnemonic(mnemonicArea.value);
       if (!mnemonicArea.value.trim()) { validityMsg.textContent = ''; return; }
       if (v.valid) {
-        validityMsg.textContent = 'Valid mnemonic phrase.';
-        validityMsg.style.color = '#7be495';
+        validityMsg.textContent = '有効なニーモニックフレーズです。';
+        validityMsg.style.color = '#3c763d';
       } else {
-        var reasons = { WORD_COUNT: 'Word count must be 12, 15, 18, 21 or 24.', UNKNOWN_WORD: 'Unrecognized word: ' + (v.word || ''), CHECKSUM: 'Checksum invalid — please check the words and order.', EMPTY: 'Enter a mnemonic phrase.' };
-        validityMsg.textContent = reasons[v.reason] || 'Invalid mnemonic phrase.';
-        validityMsg.style.color = '#ff8fb3';
+        var reasons = {
+          WORD_COUNT: '単語数は12, 15, 18, 21, 24のいずれかである必要があります。',
+          UNKNOWN_WORD: '認識できない単語です: ' + (v.word || ''),
+          CHECKSUM: 'チェックサムが一致しません。単語と順番を確認してください。',
+          EMPTY: 'ニーモニックフレーズを入力してください。'
+        };
+        validityMsg.textContent = reasons[v.reason] || '無効なニーモニックフレーズです。';
+        validityMsg.style.color = '#a94442';
       }
     });
 
-    var fields = buildCommonFields(COLORS);
+    var fields = buildCommonFields();
     pane.appendChild(fields.frag);
 
-    var submitBtn = el('button', {
-      width: '100%', padding: '11px', borderRadius: '6px', border: 'none',
-      background: COLORS.primary, color: '#fff', fontSize: '14px', cursor: 'pointer', marginTop: '4px'
-    });
-    submitBtn.textContent = 'Import wallet';
+    var submitBtn = el('button', { width: '100%' }, { type: 'button', 'class': 'btn btn-primary' });
+    submitBtn.textContent = 'ウォレットをインポート';
     pane.appendChild(submitBtn);
 
     submitBtn.addEventListener('click', function () {
       var v = validateMnemonic(mnemonicArea.value);
-      if (!v.valid) { showMessage(pane, 'Please enter a valid mnemonic phrase before continuing.', true); return; }
+      if (!v.valid) { showMessage(pane, '有効なニーモニックフレーズを入力してください。', true); return; }
       var common = validateCommon(fields, pane);
       if (!common) return;
       submitBtn.disabled = true;
-      submitBtn.textContent = 'Importing...';
+      submitBtn.textContent = 'インポート中...';
       try {
         var privateKey = nemPrivateKeyFromMnemonic(mnemonicArea.value.trim(), common.passphrase, common.accountIndex);
         finalizeWallet(injector, {
           walletName: common.walletName, password: common.password, network: common.network, privateKey: privateKey
         }, function (wallet, loggedIn) {
-          submitBtn.textContent = 'Done';
-          if (loggedIn) {
-            showMessage(pane, 'Wallet "' + common.walletName + '" imported. Opening your dashboard...', false);
-            setTimeout(close, 900);
-          } else {
-            showMessage(pane, 'Wallet "' + common.walletName + '" imported but could not be opened automatically. Reload the login page and select it from your wallet list.', true);
-          }
+          submitBtn.textContent = '完了';
+          encryptMnemonicBackup(mnemonicArea.value.trim(), common.password).then(function (backup) {
+            saveBackup(injector, wallet.accounts[0].address, backup);
+          }).catch(function () { /* backup storage is best-effort */ });
+          showMessage(pane, loggedIn ? 'ウォレット「' + common.walletName + '」をインポートしました。ダッシュボードに移動します...' : 'ウォレットはインポートされましたが自動的に開けませんでした。ログイン画面から選択してください。', !loggedIn);
+          if (onDone) onDone(wallet, loggedIn);
         }, function (msg) {
           submitBtn.disabled = false;
-          submitBtn.textContent = 'Import wallet';
+          submitBtn.textContent = 'ウォレットをインポート';
           showMessage(pane, msg, true);
         });
       } catch (e) {
         submitBtn.disabled = false;
-        submitBtn.textContent = 'Import wallet';
-        showMessage(pane, 'Could not derive a key from this mnemonic: ' + e.message, true);
+        submitBtn.textContent = 'ウォレットをインポート';
+        showMessage(pane, 'このニーモニックから鍵を導出できませんでした: ' + e.message, true);
       }
     });
 
     return pane;
+  }
+
+
+  //////////////////////////////////////////////////////////////////////////
+  // Template patches — insert new markup into the app's own real templates
+  // (fetched from $templateCache, patched, put back), instead of using a
+  // separate floating window. Idempotent: safe to call repeatedly.
+  //////////////////////////////////////////////////////////////////////////
+
+  function patchSignupTemplate(injector) {
+    try {
+      var $templateCache = injector.get('$templateCache');
+      var html = $templateCache.get('modules/signup/signup.html');
+      if (!html || html.indexOf('hdWalletTypeBtn') !== -1) return;
+
+      var simpleBtnAnchor = '<button class="btn btn-primary" ng-click="$ctrl.changeWalletType(1);$ctrl.start = true;" ng-mouseover="$ctrl.showInfo = 1;">';
+      if (html.indexOf(simpleBtnAnchor) === -1) return; // template shape changed: bail out safely
+
+      html = html.replace(simpleBtnAnchor,
+        '<button class="btn btn-primary" type="button" id="hdWalletTypeBtn">HDウォレット（ニーモニック）</button>\n        ' + simpleBtnAnchor);
+
+      html = html.replace(
+        '<div class="col-md-6 col-md-offset-3" ng-show="!$ctrl._selectedType">',
+        '<div class="col-md-6 col-md-offset-3" ng-show="!$ctrl._selectedType" id="walletTypeButtonsRow">'
+      );
+      html = html.replace(
+        '<div class="col-md-offset-3 col-md-6" ng-show="!$ctrl._selectedType">',
+        '<div class="col-md-offset-3 col-md-6" ng-show="!$ctrl._selectedType" id="walletTypeInfoRow">'
+      );
+
+      var hdContainer = [
+        '<div class="col-md-offset-3 col-md-6" id="hdWalletContainer" style="display:none;">',
+        '  <div class="form-group text-center">',
+        '    <button type="button" class="btn btn-dark" id="hdWalletBackBtn" style="width:auto;"><span class="fa fa-chevron-left" aria-hidden="true"></span> 戻る</button>',
+        '  </div>',
+        '  <ul class="nav nav-tabs" style="margin-bottom:15px;">',
+        '    <li class="active" id="hdTabCreateLi"><a href="" id="hdTabCreate">新規作成</a></li>',
+        '    <li id="hdTabImportLi"><a href="" id="hdTabImport">インポート</a></li>',
+        '  </ul>',
+        '  <div id="hdTabBody"></div>',
+        '</div>'
+      ].join('\n');
+
+      var insertAnchor = '<!-- Start the signup process -->';
+      if (html.indexOf(insertAnchor) === -1) return;
+      html = html.replace(insertAnchor, hdContainer + '\n    ' + insertAnchor);
+
+      $templateCache.put('modules/signup/signup.html', html);
+    } catch (e) { /* fail safe: signup screen stays exactly as before */ }
+  }
+
+  function patchAccountTemplate(injector) {
+    try {
+      var $templateCache = injector.get('$templateCache');
+      var html = $templateCache.get('modules/account/account.html');
+      if (!html || html.indexOf('mnemBackupShowBtn') !== -1) return;
+
+      var anchor = '<div class="panel-heading">\n          <h3>{{\'ACCOUNT_EXPORT_MOBILE\' | translate }}</h3>';
+      if (html.indexOf(anchor) === -1) return; // template shape changed: bail out safely
+
+      var panels = [
+        '<div class="panel-heading">',
+        '  <h3>ニーモニックのバックアップ</h3>',
+        '</div>',
+        '<div class="panel-body">',
+        '  <div class="form-group">',
+        '    <p class="bg-info">このウォレットをニーモニックフレーズから作成・インポートした場合のみ、パスワードを入力してバックアップを表示できます。</p>',
+        '    <div class="input-group">',
+        '      <input type="password" class="form-control" id="mnemBackupPw" placeholder="ウォレットのパスワード">',
+        '      <span class="input-group-btn showHide">',
+        '        <button class="btn btn-primary" type="button" id="mnemBackupShowBtn" style="margin-bottom:15px;"><i class="fa fa-plus"></i></button>',
+        '      </span>',
+        '    </div>',
+        '    <div id="mnemBackupResult"></div>',
+        '  </div>',
+        '</div>',
+        '',
+        '<div class="panel-heading">',
+        '  <h3>アカウント（ウォレット）の削除</h3>',
+        '</div>',
+        '<div class="panel-body">',
+        '  <p class="bg-info">この端末に保存されているウォレット一覧から削除します。NEMブロックチェーン上のアカウント自体は削除されません。</p>',
+        '  <div class="form-group">',
+        '    <select class="form-control" id="acctDeleteSelect"></select>',
+        '  </div>',
+        '  <div id="acctDeleteConfirmArea"></div>',
+        '  <button class="btn btn-danger" type="button" id="acctDeleteBtn" style="width:100%;">削除する</button>',
+        '</div>',
+        ''
+      ].join('\n');
+
+      html = html.replace(anchor, panels + anchor);
+      $templateCache.put('modules/account/account.html', html);
+    } catch (e) { /* fail safe: account screen stays exactly as before */ }
+  }
+
+
+  //////////////////////////////////////////////////////////////////////////
+  // Signup page wiring
+  //////////////////////////////////////////////////////////////////////////
+
+  function renderSignupTab(injector, which) {
+    var body = document.getElementById('hdTabBody');
+    var liCreate = document.getElementById('hdTabCreateLi');
+    var liImport = document.getElementById('hdTabImportLi');
+    if (!body) return;
+    liCreate.className = which === 'create' ? 'active' : '';
+    liImport.className = which === 'import' ? 'active' : '';
+    body.innerHTML = '';
+    body.appendChild(which === 'create' ? buildCreatePanel(injector) : buildImportPanel(injector));
+  }
+
+  function wireSignupButton(injector, hdBtn) {
+    hdBtn.addEventListener('click', function () {
+      var row1 = document.getElementById('walletTypeButtonsRow');
+      var row2 = document.getElementById('walletTypeInfoRow');
+      var container = document.getElementById('hdWalletContainer');
+      if (row1) row1.style.display = 'none';
+      if (row2) row2.style.display = 'none';
+      if (container) container.style.display = '';
+      renderSignupTab(injector, 'create');
+    });
+
+    var backBtn = document.getElementById('hdWalletBackBtn');
+    if (backBtn) backBtn.addEventListener('click', function () {
+      var row1 = document.getElementById('walletTypeButtonsRow');
+      var row2 = document.getElementById('walletTypeInfoRow');
+      var container = document.getElementById('hdWalletContainer');
+      if (container) container.style.display = 'none';
+      if (row1) row1.style.display = '';
+      if (row2) row2.style.display = '';
+    });
+
+    var tabCreate = document.getElementById('hdTabCreate');
+    var tabImport = document.getElementById('hdTabImport');
+    if (tabCreate) tabCreate.addEventListener('click', function (e) { e.preventDefault(); renderSignupTab(injector, 'create'); });
+    if (tabImport) tabImport.addEventListener('click', function (e) { e.preventDefault(); renderSignupTab(injector, 'import'); });
+  }
+
+  //////////////////////////////////////////////////////////////////////////
+  // Account page wiring
+  //////////////////////////////////////////////////////////////////////////
+
+  function getCurrentAddress(injector) {
+    try {
+      var Wallet = injector.get('Wallet');
+      return (Wallet.currentAccount && Wallet.currentAccount.address) ||
+             (Wallet.current && Wallet.current.accounts && Wallet.current.accounts[0] && Wallet.current.accounts[0].address) || '';
+    } catch (e) { return ''; }
+  }
+
+  function wireAccountBackup(injector, showBtn) {
+    showBtn.addEventListener('click', function () {
+      var pwInput = document.getElementById('mnemBackupPw');
+      var result = document.getElementById('mnemBackupResult');
+      result.innerHTML = '';
+      var address = getCurrentAddress(injector);
+      var backups = getBackups(injector);
+      var backup = backups[address];
+      if (!backup) { showMessage(result, 'このウォレットにはニーモニックのバックアップがありません（ニーモニックから作成／インポートしたウォレットのみ対象です）。', true); return; }
+
+      showBtn.disabled = true;
+      decryptMnemonicBackup(backup, pwInput.value).then(function (mnemonic) {
+        showBtn.disabled = false;
+        result.innerHTML = '';
+        var box = el('p', { fontFamily: 'monospace', wordBreak: 'break-word' }, { 'class': 'bg-info' });
+        box.textContent = mnemonic;
+        result.appendChild(box);
+        var copyBtn = el('button', { width: '100%' }, { type: 'button', 'class': 'btn btn-default' });
+        copyBtn.textContent = 'コピー';
+        copyBtn.addEventListener('click', function () {
+          try {
+            if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(mnemonic);
+            copyBtn.textContent = 'コピーしました';
+            setTimeout(function () { copyBtn.textContent = 'コピー'; }, 1500);
+          } catch (e) { /* ignore */ }
+        });
+        result.appendChild(copyBtn);
+      }).catch(function () {
+        showBtn.disabled = false;
+        showMessage(result, 'パスワードが違うか、バックアップを読み込めませんでした。', true);
+      });
+    });
+  }
+
+  function refreshDeleteSelect(injector, select) {
+    var storage = injector.get('$localStorage');
+    var wallets = storage.wallets || [];
+    select.innerHTML = '';
+    wallets.forEach(function (w, i) {
+      var opt = el('option', {}, { value: String(i) });
+      opt.textContent = w.name || '(no name)';
+      select.appendChild(opt);
+    });
+  }
+
+  function wireAccountDelete(injector, deleteBtn) {
+    var select = document.getElementById('acctDeleteSelect');
+    if (select) refreshDeleteSelect(injector, select);
+
+    deleteBtn.addEventListener('click', function () {
+      var confirmArea = document.getElementById('acctDeleteConfirmArea');
+      confirmArea.innerHTML = '';
+      var idx = parseInt(select.value, 10);
+      var storage = injector.get('$localStorage');
+      var wallets = storage.wallets || [];
+      var wallet = wallets[idx];
+      if (!wallet) { showMessage(confirmArea, '削除するウォレットを選択してください。', true); return; }
+
+      var warn = el('p', {}, { 'class': 'bg-danger' });
+      warn.textContent = 'この端末からウォレット「' + wallet.name + '」を削除します。確認のためウォレット名を入力してください。';
+      confirmArea.appendChild(warn);
+      var confirmInput = textInput('ウォレット名を正確に入力');
+      confirmArea.appendChild(confirmInput);
+      var confirmBtn = el('button', { width: '100%', marginTop: '8px' }, { type: 'button', 'class': 'btn btn-danger' });
+      confirmBtn.textContent = '削除を確定';
+      confirmArea.appendChild(confirmBtn);
+
+      confirmBtn.addEventListener('click', function () {
+        if (confirmInput.value !== wallet.name) { showMessage(confirmArea, '名前が一致しません。削除されませんでした。', true); return; }
+        try {
+          var address = (wallet.accounts && wallet.accounts[0] && wallet.accounts[0].address) || '';
+          storage.wallets = wallets.filter(function (w, i) { return i !== idx; });
+          deleteBackup(injector, address);
+
+          var wasCurrent = false;
+          try {
+            var Wallet = injector.get('Wallet');
+            if (getCurrentAddress(injector) === address) { wasCurrent = true; Wallet.current = undefined; }
+          } catch (e2) { /* best-effort */ }
+
+          injector.get('$rootScope').$applyAsync();
+          refreshDeleteSelect(injector, select);
+          confirmArea.innerHTML = '';
+          showMessage(confirmArea, 'ウォレット「' + wallet.name + '」を削除しました。', false);
+          if (wasCurrent) injector.get('$location').path('/login');
+        } catch (e) {
+          showMessage(confirmArea, '削除に失敗しました: ' + e.message, true);
+        }
+      });
+    });
+  }
+
+  //////////////////////////////////////////////////////////////////////////
+  // Boot: poll for the injector (mirrors dynamic-nodes.js elsewhere in this
+  // app), patch templates once ready, then keep watching the DOM so newly
+  // rendered pages get wired up as the user navigates around the app.
+  //////////////////////////////////////////////////////////////////////////
+
+  var INJECTOR_POLL_MS = 200;
+  var INJECTOR_POLL_MAX = 50;
+
+  function scanAndWire(injector) {
+    var hdBtn = document.getElementById('hdWalletTypeBtn');
+    if (hdBtn && !hdBtn._mnemonicWired) { hdBtn._mnemonicWired = true; wireSignupButton(injector, hdBtn); }
+
+    var backupBtn = document.getElementById('mnemBackupShowBtn');
+    if (backupBtn && !backupBtn._mnemonicWired) { backupBtn._mnemonicWired = true; wireAccountBackup(injector, backupBtn); }
+
+    var deleteBtn = document.getElementById('acctDeleteBtn');
+    if (deleteBtn && !deleteBtn._mnemonicWired) { deleteBtn._mnemonicWired = true; wireAccountDelete(injector, deleteBtn); }
+  }
+
+  function onInjectorReady(injector) {
+    patchSignupTemplate(injector);
+    patchAccountTemplate(injector);
+    scanAndWire(injector);
+    try {
+      var observer = new MutationObserver(function () { scanAndWire(injector); });
+      observer.observe(document.body, { childList: true, subtree: true });
+    } catch (e) { /* MutationObserver unavailable: initial wiring still applied above */ }
+  }
+
+  function waitForInjector(attempt) {
+    var injector = null;
+    try {
+      injector = window.angular && angular.element(document).injector();
+    } catch (e) {
+      injector = null;
+    }
+    if (injector) {
+      try { onInjectorReady(injector); } catch (e) { /* fail safe: rest of the app is unaffected */ }
+      return;
+    }
+    if (attempt >= INJECTOR_POLL_MAX) return;
+    setTimeout(function () { waitForInjector(attempt + 1); }, INJECTOR_POLL_MS);
   }
 
   waitForInjector(0);
