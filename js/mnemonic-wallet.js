@@ -981,27 +981,7 @@
     try {
       var $templateCache = injector.get('$templateCache');
       var html = $templateCache.get('modules/signup/signup.html');
-      if (!html || html.indexOf('hdWalletTypeBtn') !== -1) return;
-
-      var simpleBtnAnchor = '<button class="btn btn-primary" ng-click="$ctrl.changeWalletType(1);$ctrl.start = true;" ng-mouseover="$ctrl.showInfo = 1;">';
-      if (html.indexOf(simpleBtnAnchor) === -1) return; // template shape changed: bail out safely
-
-      html = html.replace(simpleBtnAnchor,
-        '<button class="btn btn-primary" type="button" id="hdWalletTypeBtn" style="flex:1 1 0;min-width:0;white-space:normal;">HDウォレット</button>\n        ' + simpleBtnAnchor);
-
-      html = html.replace(
-        '<div class="col-md-6 col-md-offset-3" ng-show="!$ctrl._selectedType">',
-        '<div class="col-md-6 col-md-offset-3" ng-show="!$ctrl._selectedType" id="walletTypeButtonsRow" style="display:flex;flex-wrap:nowrap;gap:6px;">' +
-        '\n  <style>#walletTypeButtonsRow > button { flex: 1 1 0; min-width: 0; white-space: normal; padding-left: 6px; padding-right: 6px; font-size: 13px; }</style>'
-      );
-      html = html.replace(
-        '<div class="col-md-offset-3 col-md-6" ng-show="!$ctrl._selectedType">',
-        '<div class="col-md-offset-3 col-md-6" ng-show="!$ctrl._selectedType" id="walletTypeInfoRow">' +
-        '\n  <div id="hdWalletInfoBox" style="display:none;">' +
-        '\n    <p><i class="fa fa-info-circle" aria-hidden="true"></i> HDウォレットは、1つのニーモニックフレーズから複数のアカウントを生成・復元できるウォレットです。</p>' +
-        '\n    <p><i class="fa fa-warning" aria-hidden="true"></i> ニーモニックフレーズを知っている人は誰でも資金を送金できます。書き留めてオフラインの安全な場所に保管してください。</p>' +
-        '\n  </div>'
-      );
+      if (!html || html.indexOf('hdWalletContainer') !== -1) return;
 
       var hdContainer = [
         '<div class="col-md-offset-3 col-md-6" id="hdWalletContainer" style="display:none;">',
@@ -1022,6 +1002,79 @@
 
       $templateCache.put('modules/signup/signup.html', html);
     } catch (e) { /* fail safe: signup screen stays exactly as before */ }
+  }
+
+  //////////////////////////////////////////////////////////////////////////
+  // HD wallet type button + info box — injected directly into the live DOM
+  // (rather than into the $templateCache string) so it keeps working even
+  // if the wallet-type selection screen gets re-rendered from a fresh,
+  // unpatched template (e.g. after an in-app reload/reset). Runs on every
+  // scanAndWire pass, so it's self-healing: idempotent checks mean it's
+  // cheap to call repeatedly and safe if elements already exist.
+  //////////////////////////////////////////////////////////////////////////
+
+  function injectGlobalStyles() {
+    try {
+      if (document.getElementById('mnemonicWalletStyles')) return;
+      var style = document.createElement('style');
+      style.id = 'mnemonicWalletStyles';
+      style.textContent =
+        '#walletTypeButtonsRow{display:flex;flex-wrap:nowrap;gap:6px;}' +
+        '#walletTypeButtonsRow button{flex:1 1 0;min-width:0;white-space:normal;padding-left:6px;padding-right:6px;font-size:13px;}';
+      (document.head || document.documentElement).appendChild(style);
+    } catch (e) { /* best-effort: original (wrapping) layout stays as fallback */ }
+  }
+
+  function findElementWithText(selector, text) {
+    var els = document.querySelectorAll(selector);
+    for (var i = 0; i < els.length; i++) {
+      if (els[i].textContent.indexOf(text) !== -1) return els[i];
+    }
+    return null;
+  }
+
+  function ensureHdWalletUi(injector) {
+    try {
+      injectGlobalStyles();
+
+      // Anchor on the "シンプルウォレット" button and its info paragraph specifically
+      // (rather than a generic ng-show attribute selector, which can also match an
+      // unrelated ancestor/heading wrapper and cause the injected box to land in
+      // the wrong place).
+      var simpleBtn = document.querySelector('button[ng-click*="changeWalletType(1)"]');
+      var buttonsRow = simpleBtn && simpleBtn.parentNode;
+      if (!buttonsRow) return;
+      if (!buttonsRow.id) buttonsRow.id = 'walletTypeButtonsRow';
+
+      var simpleInfoP = findElementWithText('p', 'シンプルウォレットは');
+      var infoRow = simpleInfoP && simpleInfoP.parentNode;
+      if (infoRow && !infoRow.id) infoRow.id = 'walletTypeInfoRow';
+
+      var hdBtn = document.getElementById('hdWalletTypeBtn');
+      if (!hdBtn) {
+        hdBtn = document.createElement('button');
+        hdBtn.type = 'button';
+        hdBtn.id = 'hdWalletTypeBtn';
+        hdBtn.className = 'btn btn-primary';
+        hdBtn.textContent = 'HDウォレット';
+        buttonsRow.insertBefore(hdBtn, simpleBtn);
+      }
+
+      if (infoRow && !document.getElementById('hdWalletInfoBox')) {
+        var box = document.createElement('div');
+        box.id = 'hdWalletInfoBox';
+        box.style.display = 'none';
+        box.innerHTML =
+          '<p><i class="fa fa-info-circle" aria-hidden="true"></i> HDウォレットは、1つのニーモニックフレーズから複数のアカウントを生成・復元できるウォレットです。</p>' +
+          '<p><i class="fa fa-warning" aria-hidden="true"></i> ニーモニックフレーズを知っている人は誰でも資金を送金できます。書き留めてオフラインの安全な場所に保管してください。</p>';
+        infoRow.insertBefore(box, infoRow.firstChild);
+      }
+
+      if (hdBtn && !hdBtn._mnemonicWired) {
+        hdBtn._mnemonicWired = true;
+        wireSignupButton(injector, hdBtn);
+      }
+    } catch (e) { /* fail safe: falls back to whatever the page already shows */ }
   }
 
   function patchAccountTemplate(injector) {
@@ -1268,8 +1321,7 @@
   var INJECTOR_POLL_MAX = 50;
 
   function scanAndWire(injector) {
-    var hdBtn = document.getElementById('hdWalletTypeBtn');
-    if (hdBtn && !hdBtn._mnemonicWired) { hdBtn._mnemonicWired = true; wireSignupButton(injector, hdBtn); }
+    ensureHdWalletUi(injector);
 
     var backupBtn = document.getElementById('mnemBackupShowBtn');
     if (backupBtn && !backupBtn._mnemonicWired) { backupBtn._mnemonicWired = true; wireAccountBackup(injector, backupBtn); }
