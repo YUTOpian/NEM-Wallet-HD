@@ -1,10 +1,10 @@
-# NEM Wallet
+# NEM Wallet HD
 
 このリポジトリは、NEM Project が公開しているリリースアーカイブ
 
 [NEM-Wallet_2.7.1.universal.zip](https://github.com/NemProject/miscellaneous/releases/download/nanowallet%2F2.7.1/NEM-Wallet_2.7.1.universal.zip)
 
-を展開したものを初期ソースとしています。
+を展開し、Crupoさんが改良したものを初期ソースとしています。
 
 ## 起動方法
 
