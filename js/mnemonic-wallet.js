@@ -376,11 +376,10 @@
     if (!simpleBtn) return;
     var privateKeyBtn = buttonsContainer.querySelector('button[ng-click*="changeWalletType(3)"]');
 
-    /* ---- 0. ボタンを [HD新規作成] [HD復元] [シンプル] [プライベートキー] の順に配置 ---- */
+    /* ---- 0. ボタンを2行×2列(上段:HD新規作成/HD復元、下段:シンプル/プライベートキー)に配置 ---- */
     var hdCreateBtn = el('button', {
       type: 'button',
       class: 'btn btn-primary',
-      style: 'margin:0 4px;',
       text: 'HDウォレット(新規作成)',
       onmouseover: function () {
         apply(function () { $ctrl.showInfo = HD_CREATE_TYPE; });
@@ -395,7 +394,6 @@
     var hdRestoreBtn = el('button', {
       type: 'button',
       class: 'btn btn-primary',
-      style: 'margin:0 4px;',
       text: 'HDウォレット(復元)',
       onmouseover: function () {
         apply(function () { $ctrl.showInfo = HD_RESTORE_TYPE; });
@@ -407,10 +405,20 @@
         });
       }
     });
-    buttonsContainer.insertBefore(hdCreateBtn, simpleBtn);
-    buttonsContainer.insertBefore(hdRestoreBtn, simpleBtn);
-    simpleBtn.style.margin = '0 4px';
-    if (privateKeyBtn) privateKeyBtn.style.margin = '0 4px';
+
+    var typeButtonsRow1 = el('div', {
+      style: 'display:flex;justify-content:center;flex-wrap:wrap;gap:12px;margin-bottom:12px;'
+    });
+    var typeButtonsRow2 = el('div', {
+      style: 'display:flex;justify-content:center;flex-wrap:wrap;gap:12px;'
+    });
+    buttonsContainer.insertBefore(typeButtonsRow1, simpleBtn);
+    buttonsContainer.insertBefore(typeButtonsRow2, simpleBtn);
+
+    typeButtonsRow1.appendChild(hdCreateBtn);
+    typeButtonsRow1.appendChild(hdRestoreBtn);
+    typeButtonsRow2.appendChild(simpleBtn); // 元の位置から移動
+    if (privateKeyBtn) typeButtonsRow2.appendChild(privateKeyBtn); // 元の位置から移動
 
     /* ---- 説明パネル(タイプ選択画面でマウスオーバー時に表示) ---- */
     if (infoContainer) {
