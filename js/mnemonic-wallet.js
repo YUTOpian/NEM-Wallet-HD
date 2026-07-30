@@ -563,7 +563,10 @@
   }
 
   var ENTROPY_TARGET_WIDTH = 100;
-  var ENTROPY_STEP_PER_EVENT = 0.5;
+  // シンプルウォレット(main.js側 getEntropy(): width += 0.15)と同じ強度に揃える。
+  // 1回のmousemoveイベントで進む割合を減らし、100%に達するまでに必要な
+  // カーソル移動量(≒収集されるエントロピー量)をシンプルウォレットと同等にする。
+  var ENTROPY_STEP_PER_EVENT = 0.15;
 
   /* ============================================================
      マウス操作からのエントロピー収集(シンプルウォレットの
@@ -620,8 +623,21 @@
     );
     var entropyBarRow = el('div', { class: 'form-group', style: 'display:none;' }, entropyBarOuter);
 
+    // ---- 収集完了後: シンプルウォレットの「Done!」+ 戻る/次へ と同じ見た目・同じ流れにする ----
+    var entropyBackBtn2 = el('button', { type: 'button', class: 'btn btn-dark', style: 'width:auto;' });
+    entropyBackBtn2.innerHTML = '<span class="fa fa-chevron-left" aria-hidden="true"></span> 戻る';
+    var entropyNextBtn = el('button', { type: 'button', class: 'btn btn-primary', style: 'width:100%;' });
+    entropyNextBtn.innerHTML = '次へ <span class="fa fa-chevron-right" aria-hidden="true"></span>';
+    var entropyDoneRow = el('div', { class: 'row form-group', style: 'display:none;' },
+      el('div', { class: 'col-md-2 col-sm-6' }, entropyBackBtn2),
+      el('div', { class: 'col-md-10 col-sm-6' }, entropyNextBtn)
+    );
+
     entropyBackBtn.addEventListener('click', function () {
       if (deriveState.entropyCancel) { deriveState.entropyCancel(); deriveState.entropyCancel = null; }
+      apply(function () { $ctrl.step3 = true; $ctrl.step4 = false; });
+    });
+    entropyBackBtn2.addEventListener('click', function () {
       apply(function () { $ctrl.step3 = true; $ctrl.step4 = false; });
     });
 
@@ -634,26 +650,35 @@
       }, function (collected) {
         deriveState.entropy = collected;
         deriveState.entropyCancel = null;
-        entropyBarInner.textContent = 'ニーモニックを生成しています...';
-        generateMnemonicWords(256, collected)
-          .then(function (words) {
-            mnemonicInput.value = words;
-            updatePreview();
-            mnemonicPanel.style.display = '';
-            entropyPanel.style.display = 'none';
-          })
-          .catch(function (e) {
-            mnemonicPanel.style.display = '';
-            entropyPanel.style.display = 'none';
-            showError('ニーモニックの生成に失敗しました: ' + (e && e.message ? e.message : e));
-          });
+        // シンプルウォレット(main.js getEntropy())と同じ「Done!」表示
+        entropyBarInner.innerHTML = '<span class="fa fa-check-circle" aria-hidden="true"></span> Done!';
+        entropyDoneRow.style.display = '';
       });
+    });
+
+    entropyNextBtn.addEventListener('click', function () {
+      if (!deriveState.entropy || entropyNextBtn.disabled) return;
+      entropyNextBtn.disabled = true;
+      generateMnemonicWords(256, deriveState.entropy)
+        .then(function (words) {
+          mnemonicInput.value = words;
+          updatePreview();
+          mnemonicPanel.style.display = '';
+          entropyPanel.style.display = 'none';
+        })
+        .catch(function (e) {
+          mnemonicPanel.style.display = '';
+          entropyPanel.style.display = 'none';
+          showError('ニーモニックの生成に失敗しました: ' + (e && e.message ? e.message : e));
+        })
+        .then(function () { entropyNextBtn.disabled = false; });
     });
 
     var entropyPanel = el('div', { class: 'col-md-offset-3 col-md-6', style: 'display:none;' },
       entropyInfoP,
       entropyStartRow,
-      entropyBarRow
+      entropyBarRow,
+      entropyDoneRow
     );
 
     var mnemonicInput = el('textarea', {
@@ -804,6 +829,7 @@
           mnemonicPanel.style.display = 'none';
           entropyStartRow.style.display = '';
           entropyBarRow.style.display = 'none';
+          entropyDoneRow.style.display = 'none';
           entropyBarInner.style.width = '0%';
           entropyBarInner.textContent = '';
         } else {
@@ -812,6 +838,7 @@
           // ステップを離れたら、DOM/メモリ上にニーモニックやエントロピーを残さないよう破棄する
           if (deriveState.entropyCancel) { deriveState.entropyCancel(); deriveState.entropyCancel = null; }
           deriveState.entropy = null;
+          entropyDoneRow.style.display = 'none';
           mnemonicInput.value = '';
           deriveState.privateKeyHex = null;
           errorBox.style.display = 'none';
