@@ -123,23 +123,94 @@
     return bin;
   }
 
-  function generateMnemonicWords(strengthBits) {
-    strengthBits = strengthBits || 256;
-    return loadWordlist().then(function (wordlist) {
-      var entropyBytes = crypto.getRandomValues(new Uint8Array(strengthBits / 8));
-      return crypto.subtle.digest('SHA-256', entropyBytes).then(function (hashBuf) {
-        var hashBytes = new Uint8Array(hashBuf);
-        var entropyBits = bytesToBinary(entropyBytes);
-        var checksumBitLength = strengthBits / 32;
-        var checksumBits = bytesToBinary(hashBytes).slice(0, checksumBitLength);
-        var bits = entropyBits + checksumBits;
+  /* ------------------------------------------------------------
+     追加エントロピー(マウス移動などから集めた文字列)を、
+     必要なバイト数ぶんSHA-256で繰り返し引き伸ばす(簡易KDF)。
+  ------------------------------------------------------------ */
+  function expandEntropyBytes(str, byteLen) {
+    var enc = new TextEncoder();
+    var chunks = [];
 
-        var words = [];
-        for (var i = 0; i < bits.length; i += 11) {
-          var idx = parseInt(bits.slice(i, i + 11), 2);
-          words.push(wordlist[idx]);
+    function next() {
+      var have = chunks.reduce(function (n, c) { return n + c.length; }, 0);
+      if (have >= byteLen) {
+        var out = new Uint8Array(byteLen);
+        var offset = 0;
+        for (var i = 0; i < chunks.length && offset < byteLen; i++) {
+          var c = chunks[i];
+          var n = Math.min(c.length, byteLen - offset);
+          out.set(c.subarray(0, n), offset);
+          offset += n;
         }
-        return words.join(' ');
+        return Promise.resolve(out);
+      }
+      var data = enc.encode(str + '|' + chunks.length);
+      return crypto.subtle.digest('SHA-256', data).then(function (buf) {
+        chunks.push(new Uint8Array(buf));
+        return next();
+      });
+    }
+
+    return next();
+  }
+
+  /* ------------------------------------------------------------
+     マウス移動を利用してエントロピーを追加収集する
+     (シンプルウォレット作成時の乱数収集と同様の仕組み)。
+     完了(進捗100%)したら収集した文字列を渡してコールバックする。
+     戻り値: 収集を途中で打ち切るためのキャンセル関数。
+  ------------------------------------------------------------ */
+  function collectEntropy(barFillEl, onDone) {
+    var width = 0;
+    var entropy = '';
+    function handler(e) {
+      if (width >= 100) return;
+      entropy += e.pageX + '' + e.pageY;
+      width += 0.15;
+      if (width > 100) width = 100;
+      barFillEl.style.width = width + '%';
+      barFillEl.textContent = Math.round(width) + '%';
+      if (width >= 100) {
+        document.removeEventListener('mousemove', handler);
+        barFillEl.innerHTML = '<span class="fa fa-check-circle" aria-hidden="true"></span> Done!';
+        onDone(entropy);
+      }
+    }
+    document.addEventListener('mousemove', handler);
+    return function cancel() {
+      document.removeEventListener('mousemove', handler);
+    };
+  }
+
+  function generateMnemonicWords(strengthBits, extraEntropy) {
+    strengthBits = strengthBits || 256;
+    var byteLen = strengthBits / 8;
+    return loadWordlist().then(function (wordlist) {
+      var randomBytes = crypto.getRandomValues(new Uint8Array(byteLen));
+      var entropyBytesPromise = extraEntropy
+        ? expandEntropyBytes(extraEntropy, byteLen).then(function (extraBytes) {
+            // マウス移動から集めた追加エントロピーを乱数バイト列とXOR合成する
+            var mixed = new Uint8Array(byteLen);
+            for (var i = 0; i < byteLen; i++) mixed[i] = randomBytes[i] ^ extraBytes[i];
+            return mixed;
+          })
+        : Promise.resolve(randomBytes);
+
+      return entropyBytesPromise.then(function (entropyBytes) {
+        return crypto.subtle.digest('SHA-256', entropyBytes).then(function (hashBuf) {
+          var hashBytes = new Uint8Array(hashBuf);
+          var entropyBits = bytesToBinary(entropyBytes);
+          var checksumBitLength = strengthBits / 32;
+          var checksumBits = bytesToBinary(hashBytes).slice(0, checksumBitLength);
+          var bits = entropyBits + checksumBits;
+
+          var words = [];
+          for (var i = 0; i < bits.length; i += 11) {
+            var idx = parseInt(bits.slice(i, i + 11), 2);
+            words.push(wordlist[idx]);
+          }
+          return words.join(' ');
+        });
       });
     });
   }
@@ -519,9 +590,9 @@
     buildStep4Panel(signupPageEl, ngScope, $ctrl, apply, {
       type: HD_CREATE_TYPE,
       showGenerateButton: true,
-      showPassphrase: true,
+      showPassphrase: false,
       showAddressPreview: true,
-      headerText: 'ニーモニックを入力してください(お持ちでない場合は新規生成できます)',
+      headerText: '',
       finalButtonLabel: '作成'
     });
     buildStep4Panel(signupPageEl, ngScope, $ctrl, apply, {
@@ -543,17 +614,19 @@
     if (!host) return;
 
     var deriveState = { privateKeyHex: null };
+    // シンプルウォレット作成時の $ctrl.formData.entropy / $ctrl.progressBar / $ctrl.entropyDone と
+    // 同じ役割を、このパネル内だけで完結させるための状態
+    var entropyState = { value: null, cancel: null };
 
     var mnemonicInput = el('textarea', {
       class: 'form-control',
       rows: opts.showGenerateButton ? '3' : '2',
+      wrap: 'soft',
+      style: 'width:100%;max-width:100%;white-space:pre-wrap;word-wrap:break-word;word-break:break-word;overflow-wrap:break-word;box-sizing:border-box;resize:vertical;',
       placeholder: opts.showGenerateButton
-        ? 'ニーモニック(12〜24単語)を入力、または下のボタンで新規生成してください'
+        ? '下のエントロピー収集後に自動生成されます(手入力で上書きすることもできます)'
         : 'ニーモニック(12〜24単語)を入力してください'
     });
-    var generateBtn = opts.showGenerateButton
-      ? el('button', { type: 'button', class: 'btn btn-dark', text: '新しいニーモニックを生成(24語)' })
-      : null;
     var passphraseInput = opts.showPassphrase
       ? el('input', {
           class: 'form-control',
@@ -586,6 +659,13 @@
 
     var backBtn = el('button', { type: 'button', class: 'btn btn-dark', style: 'width:auto;' });
     backBtn.innerHTML = '<span class="fa fa-chevron-left" aria-hidden="true"></span> 戻る';
+
+    function goToTypeSelect() {
+      apply(function () {
+        $ctrl._selectedType = undefined;
+        $ctrl.hideAllSteps();
+      });
+    }
 
     function showError(msg) {
       errorText.textContent = msg;
@@ -637,27 +717,7 @@
     if (passphraseInput) passphraseInput.addEventListener('input', updatePreview);
     indexInput.addEventListener('input', updatePreview);
 
-    if (generateBtn) {
-      generateBtn.addEventListener('click', function () {
-        generateBtn.disabled = true;
-        generateMnemonicWords(256)
-          .then(function (words) {
-            mnemonicInput.value = words;
-            updatePreview();
-          })
-          .catch(function (e) {
-            showError('ニーモニックの生成に失敗しました: ' + (e && e.message ? e.message : e));
-          })
-          .then(function () { generateBtn.disabled = false; });
-      });
-    }
-
-    backBtn.addEventListener('click', function () {
-      apply(function () {
-        $ctrl._selectedType = undefined;
-        $ctrl.hideAllSteps();
-      });
-    });
+    backBtn.addEventListener('click', goToTypeSelect);
 
     finalBtn.addEventListener('click', function () {
       if (!deriveState.privateKeyHex || finalBtn.disabled) return;
@@ -669,17 +729,134 @@
       });
     });
 
-    var panel = el(
+    /* ----------------------------------------------------------
+       エントロピー収集ステップ。
+       シンプルウォレット作成時(ネイティブ実装, ng-show="$ctrl.step4 && $ctrl._selectedType.type === 1")と
+       全く同じ見た目・同じ操作手順(説明文 → 「開始」 → 進捗バー → 「次へ」)を再現する。
+       新規作成(HD_CREATE_TYPE)の場合のみ、ニーモニック入力欄より先にこのステップを表示する。
+    ---------------------------------------------------------- */
+    var entropyPanel = null;
+    var showPhase = null;
+
+    if (opts.showGenerateButton) {
+      var entropyInfoP = el(
+        'p',
+        { class: 'text-center' },
+        'マウスカーソルを動かして、乱数の元となる「エントロピー」を追加してください。追加した情報は、あなたのニーモニック(24単語)の生成にのみ使われます。'
+      );
+
+      var entropyStartBackBtn = el('button', { type: 'button', class: 'btn btn-dark', style: 'width:auto;' });
+      entropyStartBackBtn.innerHTML = '<span class="fa fa-chevron-left" aria-hidden="true"></span> 戻る';
+      entropyStartBackBtn.addEventListener('click', goToTypeSelect);
+
+      var entropyStartBtn = el('button', { type: 'button', class: 'btn btn-primary', style: 'width:100%;' });
+      entropyStartBtn.innerHTML = '<span class="fa fa-play-circle-o" aria-hidden="true"></span> 開始';
+
+      var entropyStartRow = el(
+        'div',
+        { class: 'form-group' },
+        el('hr', { style: 'border-color:#444;' }),
+        el(
+          'div',
+          { class: 'row' },
+          el('div', { class: 'col-md-2 col-sm-6' }, entropyStartBackBtn),
+          el('div', { class: 'col-md-10 col-sm-6' }, entropyStartBtn)
+        )
+      );
+
+      var entropyBarFill = el('div', {
+        style: 'height:20px;line-height:20px;color:#fff;text-align:center;font-size:12px;background-color:#5cb85c;width:0%;transition:width .15s linear;'
+      });
+      var entropyProgressRow = el(
+        'div',
+        { class: 'form-group', style: 'display:none;' },
+        el('div', { class: 'progressBar', style: 'background:#222;border-radius:2px;overflow:hidden;' }, entropyBarFill),
+        el('hr', { style: 'border-color:#444;' })
+      );
+
+      var entropyNextBackBtn = el('button', { type: 'button', class: 'btn btn-dark', style: 'width:auto;' });
+      entropyNextBackBtn.innerHTML = '<span class="fa fa-chevron-left" aria-hidden="true"></span> 戻る';
+      entropyNextBackBtn.addEventListener('click', goToTypeSelect);
+
+      var entropyNextBtn = el('button', {
+        type: 'button',
+        class: 'btn btn-primary',
+        style: 'width:100%;',
+        disabled: 'disabled'
+      });
+      entropyNextBtn.innerHTML = '次へ <span class="fa fa-chevron-right" aria-hidden="true"></span>';
+
+      var entropyNextRow = el(
+        'div',
+        { class: 'row form-group', style: 'display:none;' },
+        el('div', { class: 'col-md-2 col-sm-6' }, entropyNextBackBtn),
+        el('div', { class: 'col-md-10 col-sm-6' }, entropyNextBtn)
+      );
+
+      entropyStartBtn.addEventListener('click', function () {
+        entropyStartRow.style.display = 'none';
+        entropyProgressRow.style.display = '';
+        entropyBarFill.style.width = '0%';
+        entropyBarFill.textContent = '0%';
+        entropyState.cancel = collectEntropy(entropyBarFill, function (extraEntropy) {
+          entropyState.cancel = null;
+          entropyState.value = extraEntropy;
+          entropyNextRow.style.display = '';
+          entropyNextBtn.disabled = false;
+        });
+      });
+
+      entropyNextBtn.addEventListener('click', function () {
+        if (!entropyState.value || entropyNextBtn.disabled) return;
+        entropyNextBtn.disabled = true;
+        generateMnemonicWords(256, entropyState.value)
+          .then(function (words) {
+            mnemonicInput.value = words;
+            updatePreview();
+            showPhase('mnemonic');
+          })
+          .catch(function (e) {
+            showPhase('mnemonic');
+            showError('ニーモニックの生成に失敗しました: ' + (e && e.message ? e.message : e));
+          })
+          .then(function () { entropyNextBtn.disabled = false; });
+      });
+
+      entropyPanel = el(
+        'div',
+        {},
+        el('div', { class: 'form-group' }, entropyInfoP),
+        entropyStartRow,
+        entropyProgressRow,
+        entropyNextRow
+      );
+    }
+
+    function resetEntropyPhaseUi() {
+      if (entropyState.cancel) {
+        entropyState.cancel();
+        entropyState.cancel = null;
+      }
+      entropyState.value = null;
+      if (!opts.showGenerateButton) return;
+      entropyStartRow.style.display = '';
+      entropyProgressRow.style.display = 'none';
+      entropyNextRow.style.display = 'none';
+      entropyNextBtn.disabled = true;
+      entropyBarFill.style.width = '0%';
+      entropyBarFill.textContent = '0%';
+    }
+
+    var mnemonicFieldset = el(
       'div',
-      { class: 'col-md-offset-3 col-md-6', style: 'display:none;' },
+      {},
       el(
         'fieldset',
         { class: 'form-group' },
-        el('p', { class: 'text-center', text: opts.headerText }),
+        opts.headerText ? el('p', { class: 'text-center', text: opts.headerText }) : null,
         mnemonicInput
       ),
-      generateBtn ? el('div', { class: 'form-group text-center' }, generateBtn) : null,
-      generateBtn
+      opts.showGenerateButton
         ? el(
             'p',
             { class: 'text-center', style: 'font-size:12px;color:#888;' },
@@ -719,6 +896,15 @@
       )
     );
 
+    var panel = el('div', { class: 'col-md-offset-3 col-md-6', style: 'display:none;' }, entropyPanel, mnemonicFieldset);
+
+    showPhase = function (phase) {
+      if (entropyPanel) entropyPanel.style.display = phase === 'entropy' ? '' : 'none';
+      mnemonicFieldset.style.display = phase === 'mnemonic' ? '' : 'none';
+    };
+    // 新規作成: エントロピー収集からスタート / 復元: 従来通りニーモニック入力からスタート
+    showPhase(opts.showGenerateButton ? 'entropy' : 'mnemonic');
+
     host.insertBefore(panel, privKeyStep4 ? privKeyStep4.nextSibling : null);
 
     ngScope.$watch(
@@ -731,10 +917,13 @@
           // ステップを離れたら、DOM/メモリ上にニーモニックを残さないよう破棄する
           mnemonicInput.value = '';
           if (passphraseInput) passphraseInput.value = '';
+          indexInput.value = '0';
           deriveState.privateKeyHex = null;
           errorBox.style.display = 'none';
           if (previewFieldset) previewFieldset.style.display = 'none';
           finalBtn.disabled = true;
+          resetEntropyPhaseUi();
+          showPhase(opts.showGenerateButton ? 'entropy' : 'mnemonic');
         }
       }
     );
