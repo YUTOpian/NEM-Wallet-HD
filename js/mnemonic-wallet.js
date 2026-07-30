@@ -120,23 +120,43 @@
     return bin;
   }
 
-  function generateMnemonicWords(strengthBits) {
+  function generateMnemonicWords(strengthBits, extraEntropyStr) {
     strengthBits = strengthBits || 256;
     return loadWordlist().then(function (wordlist) {
-      var entropyBytes = crypto.getRandomValues(new Uint8Array(strengthBits / 8));
-      return crypto.subtle.digest('SHA-256', entropyBytes).then(function (hashBuf) {
-        var hashBytes = new Uint8Array(hashBuf);
-        var entropyBits = bytesToBinary(entropyBytes);
-        var checksumBitLength = strengthBits / 32;
-        var checksumBits = bytesToBinary(hashBytes).slice(0, checksumBitLength);
-        var bits = entropyBits + checksumBits;
+      var randomBytes = crypto.getRandomValues(new Uint8Array(strengthBits / 8));
 
-        var words = [];
-        for (var i = 0; i < bits.length; i += 11) {
-          var idx = parseInt(bits.slice(i, i + 11), 2);
-          words.push(wordlist[idx]);
-        }
-        return words.join(' ');
+      // シンプルウォレット(main.js側 getEntropy())と同様に、システムの
+      // 乱数だけでなくユーザーのマウス操作から集めた追加のエントロピーを
+      // 混ぜ合わせる。SHA-256でハッシュ化して混合することで、片方の
+      // 情報源だけに依存しないようにする。
+      var mixPromise;
+      if (extraEntropyStr) {
+        var extraBytes = new TextEncoder().encode(extraEntropyStr);
+        var mixInput = new Uint8Array(extraBytes.length + randomBytes.length);
+        mixInput.set(extraBytes, 0);
+        mixInput.set(randomBytes, extraBytes.length);
+        mixPromise = crypto.subtle.digest('SHA-256', mixInput).then(function (mixedBuf) {
+          return new Uint8Array(mixedBuf).slice(0, strengthBits / 8);
+        });
+      } else {
+        mixPromise = Promise.resolve(randomBytes);
+      }
+
+      return mixPromise.then(function (entropyBytes) {
+        return crypto.subtle.digest('SHA-256', entropyBytes).then(function (hashBuf) {
+          var hashBytes = new Uint8Array(hashBuf);
+          var entropyBits = bytesToBinary(entropyBytes);
+          var checksumBitLength = strengthBits / 32;
+          var checksumBits = bytesToBinary(hashBytes).slice(0, checksumBitLength);
+          var bits = entropyBits + checksumBits;
+
+          var words = [];
+          for (var i = 0; i < bits.length; i += 11) {
+            var idx = parseInt(bits.slice(i, i + 11), 2);
+            words.push(wordlist[idx]);
+          }
+          return words.join(' ');
+        });
       });
     });
   }
@@ -542,6 +562,35 @@
     }
   }
 
+  var ENTROPY_TARGET_WIDTH = 100;
+  var ENTROPY_STEP_PER_EVENT = 0.5;
+
+  /* ============================================================
+     マウス操作からのエントロピー収集(シンプルウォレットの
+     getEntropy()と同じ考え方: パスワード入力後、鍵/ニーモニックを
+     生成する前にカーソル移動を集めてランダム性を追加する)。
+     collectedText: 蓄積された "x座標y座標" の文字列
+     onProgress(percent): 進捗表示コールバック
+     onDone(collectedText): 収集完了コールバック
+  ============================================================ */
+  function collectMouseEntropy(onProgress, onDone) {
+    var width = 0;
+    var collected = '';
+    function handler(e) {
+      if (width >= ENTROPY_TARGET_WIDTH) return;
+      collected += String(e.pageX) + String(e.pageY);
+      width += ENTROPY_STEP_PER_EVENT;
+      if (width > ENTROPY_TARGET_WIDTH) width = ENTROPY_TARGET_WIDTH;
+      onProgress(width);
+      if (width >= ENTROPY_TARGET_WIDTH) {
+        document.removeEventListener('mousemove', handler);
+        onDone(collected);
+      }
+    }
+    document.addEventListener('mousemove', handler);
+    return function cancel() { document.removeEventListener('mousemove', handler); };
+  }
+
   function mountStep4Panel(signupPageEl, ngScope, $ctrl, apply) {
     // ネイティブのタイプ3(プライベートキー)用ステップ4の直後に、HD用の独自ステップ4を挿入する。
     var privKeyStep4 = signupPageEl.querySelector(
@@ -550,19 +599,69 @@
     var host = privKeyStep4 ? privKeyStep4.parentNode : signupPageEl.querySelector('.container');
     if (!host) return;
 
-    var deriveState = { privateKeyHex: null };
+    var deriveState = { privateKeyHex: null, entropy: null, entropyCancel: null };
+
+    /* ---- エントロピー収集用サブステップ(パスワード入力の直後・ニーモニック生成の直前) ---- */
+    var entropyInfoP = el('p', { class: 'text-center' },
+      'マウスを画面上で動かして、ニーモニック生成に使うランダム性を追加してください。'
+    );
+    var entropyBarInner = el('div', { id: 'mnwEntropyBar', style: 'width:0%;height:20px;background-color:#5cb85c;transition:width 0.1s linear;color:#fff;text-align:center;font-size:11px;line-height:20px;' });
+    var entropyBarOuter = el('div', { class: 'progressBar', style: 'width:100%;height:20px;background-color:#444;' }, entropyBarInner);
+    var entropyStartBtn = el('button', { type: 'button', class: 'btn btn-primary', style: 'width:100%;' });
+    entropyStartBtn.innerHTML = '<span class="fa fa-play-circle-o" aria-hidden="true"></span> 開始';
+    var entropyBackBtn = el('button', { type: 'button', class: 'btn btn-dark', style: 'width:auto;' });
+    entropyBackBtn.innerHTML = '<span class="fa fa-chevron-left" aria-hidden="true"></span> 戻る';
+
+    var entropyStartRow = el('div', { class: 'form-group' },
+      el('div', { class: 'row' },
+        el('div', { class: 'col-md-2 col-sm-6' }, entropyBackBtn),
+        el('div', { class: 'col-md-10 col-sm-6' }, entropyStartBtn)
+      )
+    );
+    var entropyBarRow = el('div', { class: 'form-group', style: 'display:none;' }, entropyBarOuter);
+
+    entropyBackBtn.addEventListener('click', function () {
+      if (deriveState.entropyCancel) { deriveState.entropyCancel(); deriveState.entropyCancel = null; }
+      apply(function () { $ctrl.step3 = true; $ctrl.step4 = false; });
+    });
+
+    entropyStartBtn.addEventListener('click', function () {
+      entropyStartRow.style.display = 'none';
+      entropyBarRow.style.display = '';
+      deriveState.entropyCancel = collectMouseEntropy(function (percent) {
+        entropyBarInner.style.width = percent + '%';
+        entropyBarInner.textContent = Math.round(percent) + '%';
+      }, function (collected) {
+        deriveState.entropy = collected;
+        deriveState.entropyCancel = null;
+        entropyBarInner.textContent = 'ニーモニックを生成しています...';
+        generateMnemonicWords(256, collected)
+          .then(function (words) {
+            mnemonicInput.value = words;
+            updatePreview();
+            mnemonicPanel.style.display = '';
+            entropyPanel.style.display = 'none';
+          })
+          .catch(function (e) {
+            mnemonicPanel.style.display = '';
+            entropyPanel.style.display = 'none';
+            showError('ニーモニックの生成に失敗しました: ' + (e && e.message ? e.message : e));
+          });
+      });
+    });
+
+    var entropyPanel = el('div', { class: 'col-md-offset-3 col-md-6', style: 'display:none;' },
+      entropyInfoP,
+      entropyStartRow,
+      entropyBarRow
+    );
 
     var mnemonicInput = el('textarea', {
       class: 'form-control',
       rows: '3',
       wrap: 'soft',
       style: 'width:100%;box-sizing:border-box;white-space:pre-wrap;word-break:break-word;overflow-wrap:break-word;',
-      placeholder: 'ニーモニック(12〜24単語)を入力、または下のボタンで新規生成してください'
-    });
-    var generateBtn = el('button', {
-      type: 'button',
-      class: 'btn btn-dark',
-      text: '新しいニーモニックを生成(24語)'
+      placeholder: 'ニーモニック(12〜24単語)。既存のニーモニックをお持ちの場合はここに貼り付けてください'
     });
     // パスフレーズ／アカウント番号のUIは廃止。常に空パスフレーズ・アカウント番号0で導出する。
     var FIXED_PASSPHRASE = '';
@@ -623,19 +722,6 @@
 
     mnemonicInput.addEventListener('input', updatePreview);
 
-    generateBtn.addEventListener('click', function () {
-      generateBtn.disabled = true;
-      generateMnemonicWords(256)
-        .then(function (words) {
-          mnemonicInput.value = words;
-          updatePreview();
-        })
-        .catch(function (e) {
-          showError('ニーモニックの生成に失敗しました: ' + (e && e.message ? e.message : e));
-        })
-        .then(function () { generateBtn.disabled = false; });
-    });
-
     backBtn.addEventListener('click', function () {
       apply(function () {
         $ctrl._selectedType = undefined;
@@ -678,7 +764,7 @@
       });
     });
 
-    var panel = el(
+    var mnemonicPanel = el(
       'div',
       { class: 'col-md-offset-3 col-md-6', style: 'display:none;' },
       el(
@@ -686,12 +772,11 @@
         { class: 'form-group' },
         mnemonicInput
       ),
-      el('div', { class: 'form-group text-center' }, generateBtn),
       el(
         'p',
         { class: 'text-center', style: 'font-size:12px;color:#888;' },
         el('i', { class: 'fa fa-exclamation-triangle' }),
-        ' 生成した単語列は誰にも見せず、紙などオフラインの安全な場所に書き留めてください。'
+        ' このニーモニックは誰にも見せず、紙などオフラインの安全な場所に書き留めてください。'
       ),
       errorBox,
       el(
@@ -702,16 +787,31 @@
       )
     );
 
-    host.insertBefore(panel, privKeyStep4 ? privKeyStep4.nextSibling : null);
+    host.insertBefore(entropyPanel, privKeyStep4 ? privKeyStep4.nextSibling : null);
+    host.insertBefore(mnemonicPanel, entropyPanel.nextSibling);
 
     ngScope.$watch(
       function () {
         return !!($ctrl.step4 && $ctrl._selectedType && $ctrl._selectedType.type === HD_TYPE);
       },
       function (show) {
-        panel.style.display = show ? '' : 'none';
-        if (!show) {
-          // ステップを離れたら、DOM/メモリ上にニーモニックを残さないよう破棄する
+        if (show) {
+          // パスワード入力(step3)を終えてこのステップに来るたび、
+          // まずエントロピー収集からやり直す(シンプルウォレットの
+          // フローと同じく、鍵/ニーモニック生成前に必ず新しい
+          // ランダム性を集め直す)。
+          entropyPanel.style.display = '';
+          mnemonicPanel.style.display = 'none';
+          entropyStartRow.style.display = '';
+          entropyBarRow.style.display = 'none';
+          entropyBarInner.style.width = '0%';
+          entropyBarInner.textContent = '';
+        } else {
+          entropyPanel.style.display = 'none';
+          mnemonicPanel.style.display = 'none';
+          // ステップを離れたら、DOM/メモリ上にニーモニックやエントロピーを残さないよう破棄する
+          if (deriveState.entropyCancel) { deriveState.entropyCancel(); deriveState.entropyCancel = null; }
+          deriveState.entropy = null;
           mnemonicInput.value = '';
           deriveState.privateKeyHex = null;
           errorBox.style.display = 'none';
